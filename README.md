@@ -3,11 +3,10 @@
 </p>
 
 <h1 align="center">Alacritty - A fast, cross-platform, OpenGL terminal emulator</h1>
-<h3 align="center">Fork with native pane tiling &amp; command history suggestions</h3>
+<h3 align="center">WIP Fork with native pane tiling, command history suggestions &amp; log search</h3>
 
 <p align="center">
-  <img alt="Alacritty - A fast, cross-platform, OpenGL terminal emulator"
-       src="https://raw.githubusercontent.com/alacritty/alacritty/master/extra/promo/alacritty-readme.png">
+    <img width="1194" height="682" alt="alacritty-touchgrass" src="https://github.com/user-attachments/assets/96cd47e6-7870-46ee-84d5-80babd22ea48" />
 </p>
 
 ## About
