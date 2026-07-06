@@ -42,16 +42,24 @@ impl<'a> RenderableContent<'a> {
         config: &'a UiConfig,
         display: &'a mut Display,
         term: &'a Term<T>,
-        search_state: &'a mut SearchState,
+        search_state: Option<&'a mut SearchState>,
+        is_active: bool,
     ) -> Self {
-        let search = search_state.dfas().map(|dfas| HintMatches::visible_regex_matches(term, dfas));
-        let focused_match = search_state.focused_match();
+        let (search, focused_match, search_active) = match search_state {
+            Some(state) => {
+                let search =
+                    state.dfas().map(|dfas| HintMatches::visible_regex_matches(term, dfas));
+                let focused_match = state.focused_match();
+                (search, focused_match, state.regex().is_some())
+            },
+            None => (None, None, false),
+        };
         let terminal_content = term.renderable_content();
 
         // Find terminal cursor shape.
         let cursor_shape = if terminal_content.cursor.shape == CursorShape::Hidden
-            || display.cursor_hidden
-            || search_state.regex().is_some()
+            || (is_active && display.cursor_hidden)
+            || search_active
             || display.ime.preedit().is_some()
         {
             CursorShape::Hidden

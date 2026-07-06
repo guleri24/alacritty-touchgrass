@@ -223,6 +223,42 @@ pub enum Action {
     /// Create new window in a tab.
     CreateNewTab,
 
+    /// Split the current pane horizontally (pane below).
+    SplitHorizontal,
+
+    /// Split the current pane vertically (pane to the right).
+    SplitVertical,
+
+    /// Focus the pane to the left.
+    FocusPaneLeft,
+
+    /// Focus the pane to the right.
+    FocusPaneRight,
+
+    /// Focus the pane above.
+    FocusPaneUp,
+
+    /// Focus the pane below.
+    FocusPaneDown,
+
+    /// Close the current pane.
+    ClosePane,
+
+    /// Toggle pane zoom (fullscreen the active pane).
+    TogglePaneZoom,
+
+    /// Resize the current pane border to the left.
+    ResizePaneLeft,
+
+    /// Resize the current pane border to the right.
+    ResizePaneRight,
+
+    /// Resize the current pane border upward.
+    ResizePaneUp,
+
+    /// Resize the current pane border downward.
+    ResizePaneDown,
+
     /// Toggle fullscreen.
     ToggleFullscreen,
 
@@ -246,6 +282,9 @@ pub enum Action {
 
     /// Start a backward buffer search.
     SearchBackward,
+
+    /// Toggle command suggestion mode.
+    ToggleSuggestionMode,
 
     /// No action.
     None,
@@ -530,10 +569,22 @@ pub fn default_key_bindings() -> Vec<KeyBinding> {
         "w",      ModifiersState::CONTROL,  +BindingMode::SEARCH; SearchAction::SearchDeleteWord;
         "p",      ModifiersState::CONTROL,  +BindingMode::SEARCH; SearchAction::SearchHistoryPrevious;
         "n",      ModifiersState::CONTROL,  +BindingMode::SEARCH; SearchAction::SearchHistoryNext;
-        ArrowUp,                            +BindingMode::SEARCH; SearchAction::SearchHistoryPrevious;
-        ArrowDown,                          +BindingMode::SEARCH; SearchAction::SearchHistoryNext;
-        Enter,                              +BindingMode::SEARCH, ~BindingMode::VI; SearchAction::SearchFocusNext;
+        ArrowUp,                            +BindingMode::SEARCH; SearchAction::SearchFocusPrevious;
+        ArrowDown,                          +BindingMode::SEARCH; SearchAction::SearchFocusNext;
+        Enter,                              +BindingMode::SEARCH, ~BindingMode::VI; SearchAction::SearchConfirm;
         Enter, ModifiersState::SHIFT,       +BindingMode::SEARCH, ~BindingMode::VI; SearchAction::SearchFocusPrevious;
+        // Suggestion mode.
+        "s", ModifiersState::CONTROL | ModifiersState::SHIFT, ~BindingMode::SEARCH; Action::ToggleSuggestionMode;
+        // Pane focus (Vim-style, Alt prefix).
+        "h", ModifiersState::ALT, ~BindingMode::VI, ~BindingMode::SEARCH; Action::FocusPaneLeft;
+        "j", ModifiersState::ALT, ~BindingMode::VI, ~BindingMode::SEARCH; Action::FocusPaneDown;
+        "k", ModifiersState::ALT, ~BindingMode::VI, ~BindingMode::SEARCH; Action::FocusPaneUp;
+        "l", ModifiersState::ALT, ~BindingMode::VI, ~BindingMode::SEARCH; Action::FocusPaneRight;
+        // Pane management.
+        "s", ModifiersState::ALT, ~BindingMode::VI, ~BindingMode::SEARCH; Action::SplitHorizontal;
+        "v", ModifiersState::ALT, ~BindingMode::VI, ~BindingMode::SEARCH; Action::SplitVertical;
+        "w", ModifiersState::ALT, ~BindingMode::VI, ~BindingMode::SEARCH; Action::ClosePane;
+        "z", ModifiersState::ALT, ~BindingMode::VI, ~BindingMode::SEARCH; Action::TogglePaneZoom;
     );
 
     bindings.extend(platform_key_bindings());

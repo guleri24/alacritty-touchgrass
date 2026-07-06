@@ -3,6 +3,7 @@
 use crate::ConfigMonitor;
 use glutin::config::GetGlConfig;
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::cmp::min;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -60,6 +61,8 @@ use crate::display::{Display, Preedit, SizeInfo};
 use crate::input::{self, ActionContext as _, FONT_SIZE_STEP};
 use crate::logging::{LOG_TARGET_CONFIG, LOG_TARGET_WINIT};
 use crate::message_bar::{Message, MessageBuffer};
+use crate::pane::layout::{PaneId, SplitDirection};
+use crate::pane::manager::PaneManager;
 #[cfg(unix)]
 use crate::polling::ipc::{self, SocketReply};
 use crate::scheduler::{Scheduler, TimerId, Topic};
@@ -73,6 +76,12 @@ const MAX_SEARCH_WHILE_TYPING: Option<usize> = Some(1000);
 
 /// Maximum number of search terms stored in the history.
 const MAX_SEARCH_HISTORY_SIZE: usize = 255;
+
+/// Maximum number of commands stored in history.
+const MAX_COMMAND_HISTORY_SIZE: usize = 1000;
+
+/// Maximum number of suggestions shown at once.
+const MAX_SUGGESTIONS: usize = 10;
 
 /// Touch zoom speed.
 const TOUCH_ZOOM_FACTOR: f32 = 0.01;
@@ -415,7 +424,12 @@ impl ApplicationHandler<Event> for Processor {
                 }
             },
             (EventType::Terminal(TerminalEvent::Exit), Some(window_id)) => {
-                // Remove the closed terminal.
+                // Close the active pane if this window has multiple panes.
+                if self.windows.get_mut(window_id).is_some_and(|ctx| ctx.close_active_pane()) {
+                    return;
+                }
+
+                // Remove the closed terminal (single-pane window or fallback).
                 let window_context = match self.windows.entry(*window_id) {
                     // Don't exit when terminal exits if user asked to hold the window.
                     Entry::Occupied(window_context)
@@ -565,6 +579,7 @@ impl From<TerminalEvent> for EventType {
 }
 
 /// Regex search state.
+#[derive(Clone)]
 pub struct SearchState {
     /// Search direction.
     pub direction: Direction,
@@ -639,7 +654,184 @@ impl Default for SearchState {
     }
 }
 
+/// History of commands sent to the PTY.
+#[derive(Clone, Default)]
+pub struct CommandHistory {
+    commands: VecDeque<String>,
+    buffer: String,
+}
+
+impl CommandHistory {
+    /// Record bytes being sent to the PTY.
+    pub fn record(&mut self, bytes: &[u8]) {
+        if let Ok(text) = std::str::from_utf8(bytes) {
+            let mut in_escape = false;
+            for c in text.chars() {
+                // Skip bytes belonging to an escape sequence (e.g., \x1b[A from arrow keys).
+                if in_escape {
+                    if c.is_ascii_alphabetic() || c == '~' {
+                        in_escape = false;
+                    }
+                    continue;
+                }
+                match c {
+                    '\n' | '\r' => self.finish_command(),
+                    '\x08' | '\x7f' => {
+                        self.buffer.pop();
+                    },
+                    '\x15' => self.buffer.clear(), // Ctrl+U: kill line
+                    '\x17' => {
+                        // Ctrl+W: kill word backward
+                        while self.buffer.pop().is_some_and(|c| !c.is_ascii_whitespace()) {}
+                    },
+                    '\x1b' => in_escape = true, // Start of escape sequence
+                    c if !c.is_ascii_control() => {
+                        // Only push printable chars
+                        self.buffer.push(c);
+                    },
+                    _ => {},
+                }
+            }
+        }
+    }
+
+    /// Save the current buffer as a command.
+    fn finish_command(&mut self) {
+        let cmd = self.buffer.trim().to_string();
+        if !cmd.is_empty() && cmd.len() < 500 {
+            // Remove non-printable characters from the saved command.
+            let clean: String = cmd.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').collect();
+            let clean = clean.trim().to_string();
+            // Only save if it has alphanumeric content and differs from the last command.
+            if clean.len() > 1
+                && clean.chars().any(|c| c.is_ascii_alphanumeric())
+                && self.commands.back() != Some(&clean)
+            {
+                // Remove any earlier occurrence so the history stays unique.
+                self.commands.retain(|c| c != &clean);
+                if self.commands.len() >= MAX_COMMAND_HISTORY_SIZE {
+                    self.commands.pop_front();
+                }
+                self.commands.push_back(clean);
+            }
+        }
+        self.buffer.clear();
+    }
+
+    /// Get suggestions matching a prefix or any command token.
+    ///
+    /// For single-token input, matches any token in the command.
+    /// For multi-token input, the full prefix must start-match the command,
+    /// or the last token must match a token in the command.
+    pub fn suggest(&self, prefix: &str) -> Vec<String> {
+        if prefix.is_empty() {
+            return self.commands.iter().rev().take(MAX_SUGGESTIONS).cloned().collect();
+        }
+
+        let last_token = prefix.split_whitespace().last().unwrap_or("");
+
+        self.commands
+            .iter()
+            .rev()
+            .filter(|cmd| {
+                cmd.starts_with(prefix)
+                    || (!last_token.is_empty()
+                        && cmd.split_whitespace().any(|t| t.starts_with(last_token)))
+            })
+            .take(MAX_SUGGESTIONS)
+            .cloned()
+            .collect()
+    }
+
+    /// Get the current in-progress buffer.
+    pub fn current_buffer(&self) -> &str {
+        &self.buffer
+    }
+}
+
+/// State for the command suggestion overlay.
+#[derive(Clone)]
+pub struct SuggestionState {
+    pub prefix: String,
+    pub suggestions: Vec<String>,
+    pub selected: usize,
+    pub dismissed: bool,
+    pub enabled: bool,
+}
+
+impl Default for SuggestionState {
+    fn default() -> Self {
+        Self {
+            prefix: String::new(),
+            suggestions: Vec::new(),
+            selected: 0,
+            dismissed: false,
+            enabled: true,
+        }
+    }
+}
+
+impl SuggestionState {
+    /// Whether suggestions are actively being displayed.
+    pub fn active(&self) -> bool {
+        self.enabled && !self.prefix.is_empty() && !self.suggestions.is_empty() && !self.dismissed
+    }
+
+    /// Toggle suggestion mode on/off.
+    pub fn toggle(&mut self) {
+        self.enabled = !self.enabled;
+        if !self.enabled {
+            self.dismissed = true;
+        }
+    }
+
+    /// Sync the suggestion prefix from the command history buffer and recompute matches.
+    pub fn sync_from_buffer(&mut self, buffer: &str, history: &CommandHistory) {
+        self.dismissed = false;
+        if self.prefix.as_str() != buffer {
+            self.prefix = buffer.to_string();
+            if buffer.is_empty() {
+                self.suggestions.clear();
+                self.selected = 0;
+            } else {
+                self.update_suggestions(history);
+            }
+        }
+    }
+
+    /// Dismiss the current suggestion popup (user pressed Escape).
+    pub fn cancel(&mut self) {
+        self.dismissed = true;
+    }
+
+    /// Recompute suggestions from history.
+    pub fn update_suggestions(&mut self, history: &CommandHistory) {
+        self.suggestions = history.suggest(&self.prefix);
+        self.selected = self.selected.min(self.suggestions.len().saturating_sub(1));
+    }
+
+    /// Move selection to the next suggestion.
+    pub fn select_next(&mut self) {
+        if !self.suggestions.is_empty() {
+            self.selected = (self.selected + 1) % self.suggestions.len();
+        }
+    }
+
+    /// Move selection to the previous suggestion.
+    pub fn select_prev(&mut self) {
+        if !self.suggestions.is_empty() {
+            self.selected = (self.selected + self.suggestions.len() - 1) % self.suggestions.len();
+        }
+    }
+
+    /// Get the text of the currently selected suggestion.
+    pub fn selected_text(&self) -> Option<&str> {
+        self.suggestions.get(self.selected).map(|s| s.as_str())
+    }
+}
+
 /// Vi inline search state.
+#[derive(Clone)]
 pub struct InlineSearchState {
     /// Whether inline search is currently waiting for search character input.
     pub char_pending: bool,
@@ -663,6 +855,7 @@ impl Default for InlineSearchState {
 pub struct ActionContext<'a, N, T> {
     pub notifier: &'a mut N,
     pub terminal: &'a mut Term<T>,
+    pub pane_manager: Option<&'a mut PaneManager>,
     pub clipboard: &'a mut Clipboard,
     pub mouse: &'a mut Mouse,
     pub touch: &'a mut TouchPurpose,
@@ -678,6 +871,8 @@ pub struct ActionContext<'a, N, T> {
     pub scheduler: &'a mut Scheduler,
     pub search_state: &'a mut SearchState,
     pub inline_search_state: &'a mut InlineSearchState,
+    pub suggestion_state: &'a mut SuggestionState,
+    pub command_history: &'a RefCell<CommandHistory>,
     pub dirty: &'a mut bool,
     pub occluded: &'a mut bool,
     pub preserve_title: bool,
@@ -690,7 +885,22 @@ pub struct ActionContext<'a, N, T> {
 impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionContext<'a, N, T> {
     #[inline]
     fn write_to_pty<B: Into<Cow<'static, [u8]>>>(&self, val: B) {
-        self.notifier.notify(val);
+        let data: Cow<'static, [u8]> = val.into();
+        self.command_history.borrow_mut().record(&data);
+
+        // Route to the effective active pane when using panes.
+        // Check pending_focus first since it takes effect before active_pane.
+        if let Some(pm) = self.pane_manager.as_ref() {
+            let target = pm.pending_focus().or_else(|| Some(pm.active_pane_id()));
+            if let Some(id) = target {
+                if let Some(pane) = pm.pane(id) {
+                    pane.notifier.notify(data);
+                    return;
+                }
+            }
+        }
+
+        self.notifier.notify(data);
     }
 
     /// Request a redraw.
@@ -1028,9 +1238,16 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
 
     #[inline]
     fn confirm_search(&mut self) {
-        // Just cancel search when not in vi mode.
+        // When not in vi mode, confirm the match and exit search.
         if !self.terminal.mode().contains(TermMode::VI) {
-            self.cancel_search();
+            if let Some(focused_match) = &self.search_state.focused_match {
+                let start = *focused_match.start();
+                let end = *focused_match.end();
+                self.start_selection(SelectionType::Simple, start, Side::Left);
+                self.update_selection(end, Side::Right);
+                self.copy_selection(ClipboardType::Selection);
+            }
+            self.exit_search();
             return;
         }
 
@@ -1189,6 +1406,66 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     #[inline]
     fn search_active(&self) -> bool {
         self.search_state.history_index.is_some()
+    }
+
+    #[inline]
+    fn sync_suggestions(&mut self) {
+        let buffer = self.command_history.borrow().current_buffer().to_string();
+        let was_active = self.suggestion_state.active();
+        self.suggestion_state.sync_from_buffer(&buffer, &self.command_history.borrow());
+        if was_active || self.suggestion_state.active() {
+            self.display.damage_tracker.frame().mark_fully_damaged();
+            self.display.pending_update.dirty = true;
+            *self.dirty = true;
+        }
+    }
+
+    #[inline]
+    fn suggestion_select_next(&mut self) {
+        self.suggestion_state.select_next();
+        *self.dirty = true;
+    }
+
+    #[inline]
+    fn suggestion_select_prev(&mut self) {
+        self.suggestion_state.select_prev();
+        *self.dirty = true;
+    }
+
+    #[inline]
+    fn suggestion_confirm(&mut self) {
+        if let Some(command) = self.suggestion_state.selected_text() {
+            // Clear current line (Ctrl+U) before writing the full command.
+            let mut text = String::from("\x15");
+            text.push_str(command);
+            text.push('\n');
+            self.write_to_pty(text.into_bytes());
+        }
+        self.suggestion_state.dismissed = true;
+        self.display.damage_tracker.frame().mark_fully_damaged();
+        self.display.pending_update.dirty = true;
+        *self.dirty = true;
+    }
+
+    #[inline]
+    fn suggestion_cancel(&mut self) {
+        self.suggestion_state.cancel();
+        self.display.damage_tracker.frame().mark_fully_damaged();
+        self.display.pending_update.dirty = true;
+        *self.dirty = true;
+    }
+
+    #[inline]
+    fn suggestion_active(&self) -> bool {
+        self.suggestion_state.active()
+    }
+
+    #[inline]
+    fn toggle_suggestion_mode(&mut self) {
+        self.suggestion_state.toggle();
+        self.display.damage_tracker.frame().mark_fully_damaged();
+        self.display.pending_update.dirty = true;
+        *self.dirty = true;
     }
 
     /// Handle keyboard typing start.
@@ -1497,6 +1774,91 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     fn scheduler_mut(&mut self) -> &mut Scheduler {
         self.scheduler
     }
+
+    fn split_pane(&mut self, direction: SplitDirection) {
+        if let Some(ref mut pane_manager) = self.pane_manager {
+            let window_options = WindowOptions::default();
+            if let Ok(new_id) = pane_manager.split_active(
+                self.display,
+                self.event_proxy.clone(),
+                window_options,
+                direction,
+            ) {
+                pane_manager.request_focus(new_id);
+                pane_manager.resize_terminals_except_active(self.display);
+                pane_manager.resize_active_terminal(self.display, self.terminal);
+                info!("Split pane: new pane {:?}", new_id);
+            }
+        }
+    }
+
+    fn close_pane(&mut self) {
+        if let Some(ref mut pane_manager) = self.pane_manager {
+            let active = pane_manager.active_pane_id();
+            if pane_manager.close_pane(active) {
+                pane_manager.resize_terminals_except_active(self.display);
+                // self.terminal is stale (points to old closed pane) — resize the new
+                // active pane's terminal via its own lock instead.
+                let new_terminal = pane_manager.active_pane().map(|p| Arc::clone(&p.terminal));
+                if let Some(new_terminal) = new_terminal {
+                    let mut guard = new_terminal.lock();
+                    pane_manager.resize_active_terminal(self.display, &mut *guard);
+                }
+                info!("Closed pane {:?}", active);
+            }
+        }
+    }
+
+    fn toggle_pane_zoom(&mut self) {
+        if let Some(ref mut pane_manager) = self.pane_manager {
+            pane_manager.toggle_zoom();
+            *self.dirty = true;
+            self.display.pending_update.dirty = true;
+            self.display.damage_tracker.frame().mark_fully_damaged();
+        }
+    }
+
+    fn focus_pane(&mut self, direction: SplitDirection) {
+        if let Some(ref mut pane_manager) = self.pane_manager {
+            pane_manager.navigate_focus(direction);
+        }
+    }
+
+    fn resize_pane(&mut self, direction: SplitDirection, sign: f32) {
+        if let Some(ref mut pane_manager) = self.pane_manager {
+            let base = match direction {
+                SplitDirection::Vertical => self.display.size_info.cell_width(),
+                SplitDirection::Horizontal => self.display.size_info.cell_height(),
+            };
+            let amount = sign * base * 2.0;
+            pane_manager.resize_pane(pane_manager.active_pane_id(), direction, amount);
+        }
+    }
+
+    fn focus_pane_at_point(&mut self, x: f32, y: f32) -> bool {
+        if let Some(ref mut pane_manager) = self.pane_manager {
+            if let Some(clicked) = pane_manager.pane_at(x, y) {
+                // Update mouse origin for the pane we're targeting.
+                if let Some(bounds) = pane_manager.pane_bounds(clicked) {
+                    self.mouse.pane_origin_x = bounds.x;
+                    self.mouse.pane_origin_y = bounds.y;
+                }
+                if clicked != pane_manager.active_pane_id() {
+                    pane_manager.request_focus(clicked);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn pane_manager(&self) -> Option<&PaneManager> {
+        self.pane_manager.as_deref()
+    }
+
+    fn pane_manager_mut(&mut self) -> Option<&mut PaneManager> {
+        self.pane_manager.as_deref_mut()
+    }
 }
 
 impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
@@ -1613,8 +1975,9 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
         self.display.pending_update.dirty = true;
         self.search_state.history_index = None;
 
-        // Clear focused match.
+        // Clear focused match and dfas so highlights disappear from the grid.
         self.search_state.focused_match = None;
+        self.search_state.dfas = None;
     }
 
     /// Update the cursor blinking state.
@@ -1779,6 +2142,15 @@ pub struct Mouse {
     pub inside_text_area: bool,
     pub x: usize,
     pub y: usize,
+    /// Active pane border drag, if any.
+    pub drag_border: Option<(PaneId, SplitDirection)>,
+    /// Active pane corner drag (two intersecting borders), if any.
+    pub drag_corner: Vec<(PaneId, SplitDirection)>,
+    /// Timestamp of last border click (for double-click detection).
+    pub last_border_click: Instant,
+    /// Origin offset of the active pane (subtracted from x/y in `point()`).
+    pub pane_origin_x: f32,
+    pub pane_origin_y: f32,
 }
 
 impl Default for Mouse {
@@ -1797,6 +2169,11 @@ impl Default for Mouse {
             accumulated_scroll: Default::default(),
             x: Default::default(),
             y: Default::default(),
+            drag_border: None,
+            drag_corner: Vec::new(),
+            last_border_click: Instant::now(),
+            pane_origin_x: 0.,
+            pane_origin_y: 0.,
         }
     }
 }
@@ -1808,10 +2185,13 @@ impl Mouse {
     /// coordinates will be clamped to the closest grid coordinates.
     #[inline]
     pub fn point(&self, size: &SizeInfo, display_offset: usize) -> Point {
-        let col = self.x.saturating_sub(size.padding_x() as usize) / (size.cell_width() as usize);
+        let pane_x = self.x.saturating_sub(self.pane_origin_x as usize);
+        let pane_y = self.y.saturating_sub(self.pane_origin_y as usize);
+
+        let col = pane_x.saturating_sub(size.padding_x() as usize) / (size.cell_width() as usize);
         let col = min(Column(col), size.last_column());
 
-        let line = self.y.saturating_sub(size.padding_y() as usize) / (size.cell_height() as usize);
+        let line = pane_y.saturating_sub(size.padding_y() as usize) / (size.cell_height() as usize);
         let line = min(line, size.bottommost_line().0 as usize);
 
         term::viewport_to_point(display_offset, Point::new(line, col))
@@ -1940,6 +2320,17 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     WindowEvent::CloseRequested => {
                         // User asked to close the window, so no need to hold it.
                         self.ctx.window().hold = false;
+
+                        // Exit all pane terminals so the window closes entirely,
+                        // not just one pane at a time.
+                        if let Some(ref pm) = self.ctx.pane_manager {
+                            let active_id = pm.active_pane_id();
+                            for (&id, pane) in pm.panes() {
+                                if id != active_id {
+                                    pane.terminal.lock().exit();
+                                }
+                            }
+                        }
                         self.ctx.terminal.exit();
                     },
                     WindowEvent::ScaleFactorChanged { scale_factor, .. } => {

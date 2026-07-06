@@ -39,6 +39,7 @@ mod logging;
 mod macos;
 mod message_bar;
 mod migrate;
+mod pane;
 #[cfg(windows)]
 mod panic;
 #[cfg(unix)]

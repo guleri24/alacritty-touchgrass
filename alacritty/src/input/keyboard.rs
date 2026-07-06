@@ -56,8 +56,46 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         // Reset search delay when the user is still typing.
         self.reset_search_delay();
 
+        // Suggestion navigation — intercept before key bindings so Tab/Enter are consumed.
+        if self.ctx.suggestion_active() {
+            use winit::keyboard::{Key, NamedKey};
+
+            let consumed = match key.logical_key.as_ref() {
+                Key::Named(NamedKey::Enter) => {
+                    self.ctx.suggestion_confirm();
+                    true
+                },
+                Key::Named(NamedKey::Escape) => {
+                    self.ctx.suggestion_cancel();
+                    true
+                },
+                Key::Named(NamedKey::Tab) => {
+                    if self.ctx.modifiers().state().shift_key() {
+                        self.ctx.suggestion_select_prev();
+                    } else {
+                        self.ctx.suggestion_select_next();
+                    }
+                    true
+                },
+                Key::Named(NamedKey::ArrowUp) => {
+                    self.ctx.suggestion_select_prev();
+                    true
+                },
+                Key::Named(NamedKey::ArrowDown) => {
+                    self.ctx.suggestion_select_next();
+                    true
+                },
+                _ => false,
+            };
+            if consumed {
+                return;
+            }
+            // Non-consumed keys (regular text) fall through to PTY as normal.
+        }
+
         // Key bindings suppress the character input.
         if self.process_key_bindings(&key) {
+            self.ctx.sync_suggestions();
             return;
         }
 
@@ -99,6 +137,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
                 self.ctx.on_terminal_input_start();
             }
             self.ctx.write_to_pty(bytes);
+            self.ctx.sync_suggestions();
         }
     }
 

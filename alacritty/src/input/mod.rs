@@ -48,6 +48,8 @@ use crate::event::{
     ClickState, Event, EventType, InlineSearchState, Mouse, TouchPurpose, TouchZoom,
 };
 use crate::message_bar::{self, Message};
+use crate::pane::layout::SplitDirection;
+use crate::pane::manager::PaneManager;
 use crate::scheduler::{Scheduler, TimerId, Topic};
 
 pub mod keyboard;
@@ -125,6 +127,15 @@ pub trait ActionContext<T: EventListener> {
     fn advance_search_origin(&mut self, _direction: Direction) {}
     fn search_direction(&self) -> Direction;
     fn search_active(&self) -> bool;
+    fn sync_suggestions(&mut self) {}
+    fn suggestion_select_next(&mut self) {}
+    fn suggestion_select_prev(&mut self) {}
+    fn suggestion_confirm(&mut self) {}
+    fn suggestion_cancel(&mut self) {}
+    fn suggestion_active(&self) -> bool {
+        false
+    }
+    fn toggle_suggestion_mode(&mut self) {}
     fn on_typing_start(&mut self) {}
     fn toggle_vi_mode(&mut self) {}
     fn inline_search_state(&mut self) -> &mut InlineSearchState;
@@ -143,6 +154,22 @@ pub trait ActionContext<T: EventListener> {
         I: IntoIterator<Item = S> + Debug + Copy,
         S: AsRef<OsStr>,
     {
+    }
+
+    // Pane operations
+    fn split_pane(&mut self, _direction: SplitDirection) {}
+    fn close_pane(&mut self) {}
+    fn toggle_pane_zoom(&mut self) {}
+    fn focus_pane(&mut self, _direction: SplitDirection) {}
+    fn resize_pane(&mut self, _direction: SplitDirection, _sign: f32) {}
+    fn focus_pane_at_point(&mut self, _x: f32, _y: f32) -> bool {
+        false
+    }
+    fn pane_manager(&self) -> Option<&PaneManager> {
+        None
+    }
+    fn pane_manager_mut(&mut self) -> Option<&mut PaneManager> {
+        None
     }
 }
 
@@ -318,6 +345,7 @@ impl<T: EventListener> Execute<T> for Action {
             Action::Search(SearchAction::SearchHistoryPrevious) => ctx.search_history_previous(),
             Action::Search(SearchAction::SearchHistoryNext) => ctx.search_history_next(),
             Action::Mouse(MouseAction::ExpandSelection) => ctx.expand_selection(),
+            Action::ToggleSuggestionMode => ctx.toggle_suggestion_mode(),
             Action::SearchForward => ctx.start_search(Direction::Right),
             Action::SearchBackward => ctx.start_search(Direction::Left),
             Action::Copy => ctx.copy_selection(ClipboardType::Clipboard),
@@ -440,6 +468,19 @@ impl<T: EventListener> Execute<T> for Action {
             Action::SelectTab9 => ctx.window().select_tab_at_index(8),
             #[cfg(target_os = "macos")]
             Action::SelectLastTab => ctx.window().select_last_tab(),
+            // Pane operations
+            Action::SplitHorizontal => ctx.split_pane(SplitDirection::Horizontal),
+            Action::SplitVertical => ctx.split_pane(SplitDirection::Vertical),
+            Action::FocusPaneLeft => ctx.focus_pane(SplitDirection::Vertical),
+            Action::FocusPaneRight => ctx.focus_pane(SplitDirection::Vertical),
+            Action::FocusPaneUp => ctx.focus_pane(SplitDirection::Horizontal),
+            Action::FocusPaneDown => ctx.focus_pane(SplitDirection::Horizontal),
+            Action::ClosePane => ctx.close_pane(),
+            Action::TogglePaneZoom => ctx.toggle_pane_zoom(),
+            Action::ResizePaneLeft => ctx.resize_pane(SplitDirection::Vertical, -1.0),
+            Action::ResizePaneRight => ctx.resize_pane(SplitDirection::Vertical, 1.0),
+            Action::ResizePaneUp => ctx.resize_pane(SplitDirection::Horizontal, -1.0),
+            Action::ResizePaneDown => ctx.resize_pane(SplitDirection::Horizontal, 1.0),
             _ => (),
         }
     }
@@ -454,21 +495,43 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     pub fn mouse_moved(&mut self, position: PhysicalPosition<f64>) {
         let size_info = self.ctx.size_info();
 
-        let (x, y) = position.into();
-
-        let lmb_pressed = self.ctx.mouse().left_button_state == ElementState::Pressed;
-        let rmb_pressed = self.ctx.mouse().right_button_state == ElementState::Pressed;
-        if !self.ctx.selection_is_empty() && (lmb_pressed || rmb_pressed) {
-            self.update_selection_scrolling(y);
-        }
-
-        let display_offset = self.ctx.terminal().grid().display_offset();
-        let old_point = self.ctx.mouse().point(&size_info, display_offset);
+        let (x, y): (i32, i32) = position.into();
 
         let x = x.clamp(0, size_info.width() as i32 - 1) as usize;
         let y = y.clamp(0, size_info.height() as i32 - 1) as usize;
         self.ctx.mouse_mut().x = x;
         self.ctx.mouse_mut().y = y;
+
+        // Handle pane border dragging.
+        let corners = &self.ctx.mouse().drag_corner.clone();
+        if !corners.is_empty() {
+            if let Some(pane_manager) = self.ctx.pane_manager_mut() {
+                for &(target, direction) in corners {
+                    pane_manager.resize_drag(target, direction, x as f32, y as f32);
+                }
+            }
+            let mouse_state = self.cursor_state();
+            self.ctx.window().set_mouse_cursor(mouse_state);
+            return;
+        }
+
+        if let Some((target, direction)) = self.ctx.mouse().drag_border {
+            if let Some(pane_manager) = self.ctx.pane_manager_mut() {
+                pane_manager.resize_drag(target, direction, x as f32, y as f32);
+            }
+            let mouse_state = self.cursor_state();
+            self.ctx.window().set_mouse_cursor(mouse_state);
+            return;
+        }
+
+        let lmb_pressed = self.ctx.mouse().left_button_state == ElementState::Pressed;
+        let rmb_pressed = self.ctx.mouse().right_button_state == ElementState::Pressed;
+        if !self.ctx.selection_is_empty() && (lmb_pressed || rmb_pressed) {
+            self.update_selection_scrolling(y as i32);
+        }
+
+        let display_offset = self.ctx.terminal().grid().display_offset();
+        let old_point = self.ctx.mouse().point(&size_info, display_offset);
 
         let inside_text_area = size_info.contains_point(x, y);
         let cell_side = self.cell_side(x);
@@ -993,6 +1056,54 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             _ => (),
         }
 
+        // Handle pane border interaction on left-click.
+        if button == MouseButton::Left {
+            if state == ElementState::Pressed {
+                let x = self.ctx.mouse().x as f32;
+                let y = self.ctx.mouse().y as f32;
+                if let Some(pane_manager) = self.ctx.pane_manager() {
+                    let corners = pane_manager.corners_at(x, y);
+                    if corners.len() >= 2 {
+                        // Corner drag: at least two perpendicular borders intersect here.
+                        self.ctx.mouse_mut().drag_corner = corners;
+                        self.ctx.focus_pane_at_point(x, y);
+                        return;
+                    }
+                    if let Some((target, direction)) = pane_manager.border_at(x, y) {
+                        // Check for double-click on border to split.
+                        let elapsed = self.ctx.mouse().last_border_click.elapsed();
+                        self.ctx.mouse_mut().last_border_click = Instant::now();
+                        if elapsed < CLICK_THRESHOLD {
+                            // Split the active pane in the border's direction.
+                            self.ctx.split_pane(direction);
+                        } else {
+                            // Start border drag.
+                            self.ctx.mouse_mut().drag_border = Some((target, direction));
+                        }
+
+                        // Focus pane underneath the click even when clicking on a border.
+                        self.ctx.focus_pane_at_point(x, y);
+                        return;
+                    }
+                }
+            } else {
+                // Clear border drag on release.
+                self.ctx.mouse_mut().drag_border = None;
+                self.ctx.mouse_mut().drag_corner.clear();
+            }
+        }
+
+        // Focus pane on left-click.
+        // If focus actually changed, skip further mouse processing
+        // since the terminal lock still points to the old pane.
+        if state == ElementState::Pressed && button == MouseButton::Left {
+            let x = self.ctx.mouse().x as f32;
+            let y = self.ctx.mouse().y as f32;
+            if self.ctx.focus_pane_at_point(x, y) {
+                return;
+            }
+        }
+
         // Skip normal mouse events if the message bar has been clicked.
         if self.message_bar_cursor_state() == Some(CursorIcon::Pointer)
             && state == ElementState::Pressed
@@ -1095,11 +1206,32 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     /// Icon state of the cursor.
     fn cursor_state(&mut self) -> CursorIcon {
         let display_offset = self.ctx.terminal().grid().display_offset();
-        let point = self.ctx.mouse().point(&self.ctx.size_info(), display_offset);
-        let hyperlink = self.ctx.terminal().grid()[point].hyperlink();
+        let mut point = self.ctx.mouse().point(&self.ctx.size_info(), display_offset);
+        // Clamp to the terminal's grid dimensions; the point was computed
+        // from the window's SizeInfo which may be larger than the active pane's grid.
+        let grid = self.ctx.terminal().grid();
+        point.column = min(point.column, grid.last_column());
+        point.line = min(point.line, grid.bottommost_line());
+        let hyperlink = grid[point].hyperlink();
 
         // Function to check if mouse is on top of a hint.
         let hint_highlighted = |hint: &HintMatch| hint.should_highlight(point, hyperlink.as_ref());
+
+        // Check if hovering over a pane border for resize cursor.
+        if let Some(pane_manager) = self.ctx.pane_manager() {
+            let x = self.ctx.mouse().x as f32;
+            let y = self.ctx.mouse().y as f32;
+            let corners = pane_manager.corners_at(x, y);
+            if corners.len() >= 2 {
+                return CursorIcon::Move;
+            }
+            if let Some((_, direction)) = pane_manager.border_at(x, y) {
+                return match direction {
+                    SplitDirection::Vertical => CursorIcon::ColResize,
+                    SplitDirection::Horizontal => CursorIcon::RowResize,
+                };
+            }
+        }
 
         if let Some(mouse_state) = self.message_bar_cursor_state() {
             mouse_state

@@ -187,15 +187,11 @@ pub enum TermDamage<'a> {
 #[derive(Clone, Debug)]
 pub struct TermDamageIterator<'a> {
     line_damage: slice::Iter<'a, LineDamageBounds>,
-    display_offset: usize,
 }
 
 impl<'a> TermDamageIterator<'a> {
-    pub fn new(line_damage: &'a [LineDamageBounds], display_offset: usize) -> Self {
-        let num_lines = line_damage.len();
-        // Filter out invisible damage.
-        let line_damage = &line_damage[..num_lines.saturating_sub(display_offset)];
-        Self { display_offset, line_damage: line_damage.iter() }
+    pub fn new(line_damage: &'a [LineDamageBounds], _display_offset: usize) -> Self {
+        Self { line_damage: line_damage.iter() }
     }
 }
 
@@ -203,13 +199,7 @@ impl Iterator for TermDamageIterator<'_> {
     type Item = LineDamageBounds;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.line_damage.find_map(|line| {
-            line.is_damaged().then_some(LineDamageBounds::new(
-                line.line + self.display_offset,
-                line.left,
-                line.right,
-            ))
-        })
+        self.line_damage.find_map(|line| line.is_damaged().then_some(*line))
     }
 }
 
@@ -3025,7 +3015,7 @@ mod tests {
         term.scroll_display(Scroll::Delta(10));
         term.reset_damage();
 
-        // No damage when scrolled into viewport.
+        // Cursor movement in visible viewport creates damage.
         for idx in 0..term.columns() {
             term.goto(idx as i32, idx);
         }
@@ -3033,7 +3023,7 @@ mod tests {
             TermDamage::Full => panic!("Expected partial damage, however got Full"),
             TermDamage::Partial(damaged_lines) => damaged_lines,
         };
-        assert_eq!(damaged_lines.next(), None);
+        assert_eq!(damaged_lines.next(), Some(LineDamageBounds { line: 0, left: 0, right: 0 }));
 
         // Scroll back into the viewport, so we have 2 visible lines which terminal can write
         // to.
@@ -3043,19 +3033,14 @@ mod tests {
         term.goto(0, 0);
         term.goto(1, 0);
         term.goto(2, 0);
-        let display_offset = term.grid().display_offset();
         let mut damaged_lines = match term.damage() {
             TermDamage::Full => panic!("Expected partial damage, however got Full"),
             TermDamage::Partial(damaged_lines) => damaged_lines,
         };
-        assert_eq!(
-            damaged_lines.next(),
-            Some(LineDamageBounds { line: display_offset, left: 0, right: 0 })
-        );
-        assert_eq!(
-            damaged_lines.next(),
-            Some(LineDamageBounds { line: display_offset + 1, left: 0, right: 0 })
-        );
+        assert_eq!(damaged_lines.next(), Some(LineDamageBounds { line: 0, left: 0, right: 0 }),);
+        assert_eq!(damaged_lines.next(), Some(LineDamageBounds { line: 1, left: 0, right: 0 }),);
+        assert_eq!(damaged_lines.next(), Some(LineDamageBounds { line: 2, left: 0, right: 0 }),);
+        assert_eq!(damaged_lines.next(), Some(LineDamageBounds { line: 9, left: 9, right: 9 }),);
         assert_eq!(damaged_lines.next(), None);
     }
 

@@ -3,6 +3,7 @@
 </p>
 
 <h1 align="center">Alacritty - A fast, cross-platform, OpenGL terminal emulator</h1>
+<h3 align="center">Fork with native pane tiling &amp; command history suggestions</h3>
 
 <p align="center">
   <img alt="Alacritty - A fast, cross-platform, OpenGL terminal emulator"
@@ -17,6 +18,10 @@ applications, rather than reimplementing their functionality, it manages to
 provide a flexible set of [features](./docs/features.md) with high performance.
 The supported platforms currently consist of BSD, Linux, macOS and Windows.
 
+This **fork** adds native pane/tiling support (window splits) and command
+history with tab-completion suggestions. See [Pane Tiling](#pane-tiling) and
+[Command History](#command-history) below.
+
 The software is considered to be at a **beta** level of readiness; there are
 a few missing features and bugs to be fixed, but it is already used by many as
 a daily driver.
@@ -30,6 +35,36 @@ Join [`#alacritty`] on libera.chat if you have questions or looking for a quick 
 ## Features
 
 You can find an overview over the features available in Alacritty [here](./docs/features.md).
+
+### Pane Tiling
+
+Split the terminal window into multiple panes, each running its own shell.
+Navigate between panes with keyboard shortcuts, resize borders via keyboard or
+drag, and close panes when no longer needed.
+
+Default keybindings:
+
+| Action | Binding |
+|---|---|
+| Split horizontally | `Ctrl+Shift+Enter` |
+| Split vertically | `Ctrl+Shift+|` |
+| Focus pane (Up/Down/Left/Right) | `Alt+{H,J,K,L}` or `Ctrl+Shift+{Arrow}` |
+| Resize pane | `Ctrl+Shift+{Up,Down,Left,Right}` |
+| Close pane | `Ctrl+Shift+W` |
+
+### Command History & Suggestions
+
+Every command typed into a pane is recorded. Press `Tab` while typing to cycle
+through matching suggestions from the command history. Press `Enter` to accept
+a suggestion, or `Escape` to dismiss the overlay.
+
+| Action | Binding |
+|---|---|
+| Accept suggestion | `Enter` |
+| Dismiss suggestions | `Escape` |
+| Cycle next suggestion | `Tab` |
+| Cycle previous suggestion | `Shift+Tab` |
+| Toggle suggestion mode | `Ctrl+Shift+M` |
 
 ## Further information
 
@@ -101,9 +136,9 @@ usecases.
 
 Alacritty has many great features, but not every feature from every other
 terminal. This could be for a number of reasons, but sometimes it's just not a
-good fit for Alacritty. This means you won't find things like tabs or splits
-(which are best left to a window manager or [terminal multiplexer][tmux]) nor
-niceties like a GUI config editor.
+good fit for Alacritty. This means you won't find things like tabs (which are
+best left to a window manager or [terminal multiplexer][tmux]) nor niceties
+like a GUI config editor.
 
 [tmux]: https://github.com/tmux/tmux
 

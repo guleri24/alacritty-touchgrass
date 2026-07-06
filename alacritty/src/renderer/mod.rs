@@ -339,6 +339,29 @@ impl Renderer {
         }
     }
 
+    /// Set the viewport and text projection for a pane region (in window coordinates).
+    /// `width`/`height` should be the pane's padded rendering area dimensions.
+    /// `screen_height` is the full framebuffer height, used to flip Y from winit (top-left
+    /// origin) to OpenGL (bottom-left origin).
+    #[inline]
+    pub fn set_pane_viewport(&self, x: f32, y: f32, width: f32, height: f32, screen_height: f32) {
+        // OpenGL viewport uses bottom-left origin; winit uses top-left.
+        let y_gl = screen_height - y - height;
+        unsafe {
+            gl::Viewport(x as i32, y_gl as i32, width.max(1.) as i32, height.max(1.) as i32);
+        }
+        // Update text projection for this pane's padded area.
+        // The padded dimensions already exclude padding, so projection uses padding=0.
+        match &self.text_renderer {
+            TextRendererProvider::Gles2(renderer) => {
+                renderer.set_pane_projection(width, height, 0., 0.)
+            },
+            TextRendererProvider::Glsl3(renderer) => {
+                renderer.set_pane_projection(width, height, 0., 0.)
+            },
+        }
+    }
+
     /// Resize the renderer.
     pub fn resize(&self, size_info: &SizeInfo) {
         self.set_viewport(size_info);

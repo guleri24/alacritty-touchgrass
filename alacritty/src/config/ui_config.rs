@@ -30,6 +30,7 @@ use crate::config::debug::Debug;
 use crate::config::font::Font;
 use crate::config::general::General;
 use crate::config::mouse::Mouse;
+use crate::config::pane::PaneConfig;
 use crate::config::scrolling::Scrolling;
 use crate::config::selection::Selection;
 use crate::config::terminal::Terminal;
@@ -85,6 +86,10 @@ pub struct UiConfig {
 
     /// Config for the alacritty_terminal itself.
     pub terminal: Terminal,
+
+    /// Pane configuration.
+    #[serde(default)]
+    pub pane: PaneConfig,
 
     /// Keyboard configuration.
     keyboard: Keyboard,

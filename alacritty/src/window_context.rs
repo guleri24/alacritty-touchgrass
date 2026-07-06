@@ -1,20 +1,20 @@
 //! Terminal window context.
 
+use std::cell::RefCell;
 use std::error::Error;
 use std::fs::File;
 use std::io::Write;
 use std::mem;
 #[cfg(not(windows))]
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::RawFd;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use glutin::config::Config as GlutinConfig;
 use glutin::display::GetGlDisplay;
 #[cfg(all(feature = "x11", not(any(target_os = "macos", windows))))]
 use glutin::platform::x11::X11GlConfigExt;
-use log::info;
 use serde_json as json;
 use winit::event::{Event as WinitEvent, Modifiers, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
@@ -22,26 +22,27 @@ use winit::raw_window_handle::HasDisplayHandle;
 use winit::window::WindowId;
 
 use alacritty_terminal::event::Event as TerminalEvent;
-use alacritty_terminal::event_loop::{EventLoop as PtyEventLoop, Msg, Notifier};
+use alacritty_terminal::event_loop::{Msg, Notifier};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::Direction;
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Term, TermMode};
-use alacritty_terminal::tty;
 
 use crate::cli::{ParsedOptions, WindowOptions};
 use crate::clipboard::Clipboard;
 use crate::config::UiConfig;
-use crate::display::Display;
 use crate::display::window::Window;
+use crate::display::{Display, DrawContext};
 use crate::event::{
-    ActionContext, Event, EventProxy, InlineSearchState, Mouse, SearchState, TouchPurpose,
+    ActionContext, CommandHistory, Event, EventProxy, EventType, InlineSearchState, Mouse,
+    SearchState, SuggestionState, TouchPurpose,
 };
 #[cfg(unix)]
 use crate::logging::LOG_TARGET_IPC_CONFIG;
 use crate::message_bar::MessageBuffer;
-use crate::scheduler::Scheduler;
+use crate::pane::manager::PaneManager;
+use crate::scheduler::{Scheduler, TimerId, Topic};
 use crate::{input, renderer};
 
 /// Event context for one individual Alacritty window.
@@ -51,11 +52,14 @@ pub struct WindowContext {
     pub dirty: bool,
     event_queue: Vec<WinitEvent<Event>>,
     terminal: Arc<FairMutex<Term<EventProxy>>>,
+    pane_manager: Option<PaneManager>,
     cursor_blink_timed_out: bool,
     prev_bell_cmd: Option<Instant>,
     modifiers: Modifiers,
     inline_search_state: InlineSearchState,
     search_state: SearchState,
+    suggestion_state: SuggestionState,
+    command_history: RefCell<CommandHistory>,
     notifier: Notifier,
     mouse: Mouse,
     touch: TouchPurpose,
@@ -167,87 +171,43 @@ impl WindowContext {
 
     /// Create a new terminal window context.
     fn new(
-        display: Display,
+        mut display: Display,
         config: Rc<UiConfig>,
         options: WindowOptions,
         proxy: EventLoopProxy<Event>,
     ) -> Result<Self, Box<dyn Error>> {
-        let mut pty_config = config.pty_config();
-        options.terminal_options.override_pty_config(&mut pty_config);
-
         let preserve_title = options.window_identity.title.is_some();
 
-        info!(
-            "PTY dimensions: {:?} x {:?}",
-            display.size_info.screen_lines(),
-            display.size_info.columns()
-        );
+        let pane_manager = PaneManager::new(&mut display, config.clone(), options, proxy.clone())?;
+        let active_pane = pane_manager.active_pane().expect("new pane manager has active pane");
 
-        let event_proxy = EventProxy::new(proxy, display.window.id());
-
-        // Create the terminal.
-        //
-        // This object contains all of the state about what's being displayed. It's
-        // wrapped in a clonable mutex since both the I/O loop and display need to
-        // access it.
-        let terminal = Term::new(config.term_options(), &display.size_info, event_proxy.clone());
-        let terminal = Arc::new(FairMutex::new(terminal));
-
-        // Create the PTY.
-        //
-        // The PTY forks a process to run the shell on the slave side of the
-        // pseudoterminal. A file descriptor for the master side is retained for
-        // reading/writing to the shell.
-        let pty = tty::new(&pty_config, display.size_info.into(), display.window.id().into())?;
-
+        let terminal = Arc::clone(&active_pane.terminal);
+        let notifier = active_pane.notifier.clone();
         #[cfg(not(windows))]
-        let master_fd = pty.file().as_raw_fd();
+        let master_fd = active_pane.master_fd;
         #[cfg(not(windows))]
-        let shell_pid = pty.child().id();
-
-        // Create the pseudoterminal I/O loop.
-        //
-        // PTY I/O is ran on another thread as to not occupy cycles used by the
-        // renderer and input processing. Note that access to the terminal state is
-        // synchronized since the I/O loop updates the state, and the display
-        // consumes it periodically.
-        let event_loop = PtyEventLoop::new(
-            Arc::clone(&terminal),
-            event_proxy.clone(),
-            pty,
-            pty_config.drain_on_exit,
-            config.debug.ref_test,
-        )?;
-
-        // The event loop channel allows write requests from the event processor
-        // to be sent to the pty loop and ultimately written to the pty.
-        let loop_tx = event_loop.channel();
-
-        // Kick off the I/O thread.
-        let _io_thread = event_loop.spawn();
-
-        // Start cursor blinking, in case `Focused` isn't sent on startup.
-        if config.cursor.style().blinking {
-            event_proxy.send_event(TerminalEvent::CursorBlinkingChange.into());
-        }
+        let shell_pid = active_pane.shell_pid;
 
         // Create context for the Alacritty window.
         Ok(WindowContext {
             preserve_title,
             terminal,
             display,
+            pane_manager: Some(pane_manager),
             #[cfg(not(windows))]
             master_fd,
             #[cfg(not(windows))]
             shell_pid,
             config,
-            notifier: Notifier(loop_tx),
+            notifier,
             cursor_blink_timed_out: Default::default(),
             prev_bell_cmd: Default::default(),
             inline_search_state: Default::default(),
             message_buffer: Default::default(),
             window_config: Default::default(),
             search_state: Default::default(),
+            suggestion_state: Default::default(),
+            command_history: Default::default(),
             event_queue: Default::default(),
             modifiers: Default::default(),
             occluded: Default::default(),
@@ -265,7 +225,15 @@ impl WindowContext {
         self.config = self.window_config.override_config_rc(self.config.clone());
 
         self.display.update_config(&self.config);
-        self.terminal.lock().set_options(self.config.term_options());
+        if let Some(ref pm) = self.pane_manager {
+            for pane_id in pm.pane_ids() {
+                if let Some(pane) = pm.pane(pane_id) {
+                    pane.terminal.lock().set_options(self.config.term_options());
+                }
+            }
+        } else {
+            self.terminal.lock().set_options(self.config.term_options());
+        }
 
         // Reload cursor if its thickness has changed.
         if (old_config.cursor.thickness() - self.config.cursor.thickness()).abs() > f32::EPSILON {
@@ -338,6 +306,27 @@ impl WindowContext {
         &self.config
     }
 
+    /// Close the active pane in this window, falling back to the old pane if it was the last.
+    /// Returns true if a pane was closed, false if there was only one pane.
+    pub fn close_active_pane(&mut self) -> bool {
+        let pm = match self.pane_manager.as_mut() {
+            Some(pm) if pm.len() > 1 => pm,
+            _ => return false,
+        };
+        pm.close_pane(pm.active_pane_id());
+        // Sync window context terminal to the new active pane.
+        if let Some(active) = pm.active_pane() {
+            self.terminal = Arc::clone(&active.terminal);
+            self.notifier = active.notifier.clone();
+            #[cfg(not(windows))]
+            {
+                self.master_fd = active.master_fd;
+                self.shell_pid = active.shell_pid;
+            }
+        }
+        true
+    }
+
     /// Clear the window config overrides.
     #[cfg(unix)]
     pub fn reset_window_config(&mut self, config: Rc<UiConfig>) {
@@ -386,14 +375,22 @@ impl WindowContext {
             }
         }
 
-        // Redraw the window.
-        let terminal = self.terminal.lock();
+        // Redraw the window — get terminal from active pane to avoid stale ref.
+        let terminal_arc = match self.pane_manager {
+            Some(ref pm) => Arc::clone(&pm.active_pane().expect("active pane must exist").terminal),
+            None => Arc::clone(&self.terminal),
+        };
+        let terminal = terminal_arc.lock();
         self.display.draw(
             terminal,
-            scheduler,
-            &self.message_buffer,
-            &self.config,
-            &mut self.search_state,
+            DrawContext {
+                pane_manager: self.pane_manager.as_ref(),
+                scheduler,
+                message_buffer: &self.message_buffer,
+                config: &self.config,
+                search_state: &mut self.search_state,
+                suggestion_state: &self.suggestion_state,
+            },
         );
     }
 
@@ -422,7 +419,11 @@ impl WindowContext {
             },
         }
 
-        let mut terminal = self.terminal.lock();
+        let terminal_arc = match self.pane_manager {
+            Some(ref pm) => Arc::clone(&pm.active_pane().expect("active pane must exist").terminal),
+            None => Arc::clone(&self.terminal),
+        };
+        let mut terminal = terminal_arc.lock();
 
         let old_is_searching = self.search_state.history_index.is_some();
 
@@ -432,8 +433,11 @@ impl WindowContext {
             message_buffer: &mut self.message_buffer,
             inline_search_state: &mut self.inline_search_state,
             search_state: &mut self.search_state,
+            suggestion_state: &mut self.suggestion_state,
+            command_history: &self.command_history,
             modifiers: &mut self.modifiers,
             notifier: &mut self.notifier,
+            pane_manager: self.pane_manager.as_mut(),
             display: &mut self.display,
             mouse: &mut self.mouse,
             touch: &mut self.touch,
@@ -452,10 +456,12 @@ impl WindowContext {
             clipboard,
             scheduler,
         };
-        let mut processor = input::Processor::new(context);
+        {
+            let mut processor = input::Processor::new(context);
 
-        for event in self.event_queue.drain(..) {
-            processor.handle_event(event);
+            for event in self.event_queue.drain(..) {
+                processor.handle_event(event);
+            }
         }
 
         // Process DisplayUpdate events.
@@ -470,6 +476,13 @@ impl WindowContext {
                 &self.config,
             );
             self.dirty = true;
+
+            // Update pane geometry on window resize.
+            if let Some(ref mut pm) = self.pane_manager {
+                pm.update_window_size(&mut self.display);
+                pm.resize_terminals_except_active(&self.display);
+                pm.resize_active_terminal(&self.display, &mut terminal);
+            }
         }
 
         if self.dirty || self.mouse.hint_highlight_dirty {
@@ -482,6 +495,78 @@ impl WindowContext {
             self.mouse.hint_highlight_dirty = false;
         }
 
+        // Drop terminal lock so we can safely re-lock after applying pending focus.
+        drop(terminal);
+
+        // Apply pending focus before drawing so the correct terminal is rendered.
+        let old_active_pane = self.pane_manager.as_ref().map(|pm| pm.active_pane_id());
+
+        // Save per-pane state for the pane we're switching away from.
+        if let Some(old_id) = old_active_pane {
+            let saved_search = self.search_state.clone();
+            let saved_inline_search = self.inline_search_state.clone();
+            let saved_suggestion = self.suggestion_state.clone();
+            let saved_history = self.command_history.borrow().clone();
+            if let Some(ref mut pm) = self.pane_manager {
+                if let Some(pane) = pm.pane_mut(old_id) {
+                    pane.search_state = saved_search;
+                    pane.inline_search_state = saved_inline_search;
+                    pane.suggestion_state = saved_suggestion;
+                    *pane.command_history.borrow_mut() = saved_history;
+                }
+            }
+        }
+
+        if let Some(ref mut pm) = self.pane_manager {
+            pm.apply_pending_focus();
+        }
+
+        // Sync stale terminal/notifier to the current active pane.
+        let new_active_pane = self.pane_manager.as_ref().map(|pm| pm.active_pane_id());
+        if let Some(ref pm) = self.pane_manager {
+            if let Some(active) = pm.active_pane() {
+                self.terminal = Arc::clone(&active.terminal);
+                self.notifier = active.notifier.clone();
+                #[cfg(not(windows))]
+                {
+                    self.master_fd = active.master_fd;
+                    self.shell_pid = active.shell_pid;
+                }
+
+                // Restore per-pane state for the newly active pane.
+                self.search_state = active.search_state.clone();
+                self.inline_search_state = active.inline_search_state.clone();
+                self.suggestion_state = active.suggestion_state.clone();
+                *self.command_history.borrow_mut() = active.command_history.borrow().clone();
+
+                // Update mouse pane origin so coordinate transforms use the new pane's offset.
+                if let Some(bounds) = pm.pane_bounds(pm.active_pane_id()) {
+                    self.mouse.pane_origin_x = bounds.x;
+                    self.mouse.pane_origin_y = bounds.y;
+                }
+            }
+        }
+
+        // Re-lock the correct terminal for drawing (after focus is settled).
+        let terminal_arc = match self.pane_manager {
+            Some(ref pm) => Arc::clone(&pm.active_pane().expect("active pane must exist").terminal),
+            None => Arc::clone(&self.terminal),
+        };
+        let terminal = terminal_arc.lock();
+
+        // Draw with the correct terminal.
+        self.display.draw(
+            terminal,
+            DrawContext {
+                pane_manager: self.pane_manager.as_ref(),
+                scheduler,
+                message_buffer: &self.message_buffer,
+                config: &self.config,
+                search_state: &mut self.search_state,
+                suggestion_state: &self.suggestion_state,
+            },
+        );
+
         // Don't call `request_redraw` when event is `RedrawRequested` since the `dirty` flag
         // represents the current frame, but redraw is for the next frame.
         if self.dirty
@@ -490,6 +575,62 @@ impl WindowContext {
             && !matches!(event, WinitEvent::WindowEvent { event: WindowEvent::RedrawRequested, .. })
         {
             self.display.window.request_redraw();
+        }
+
+        // Reset cursor blink state when focus switches to a different pane.
+        if let (Some(old), Some(new)) = (old_active_pane, new_active_pane) {
+            if old != new {
+                if let Some(ref pm) = self.pane_manager {
+                    if let Some(active) = pm.active_pane() {
+                        let mut new_terminal = active.terminal.lock();
+
+                        // Propagate window focus state to the newly active pane, since
+                        // WindowEvent::Focused only updates the terminal that was active
+                        // at the time the event was processed.
+                        new_terminal.is_focused = true;
+
+                        let window_id = self.display.window.id();
+                        scheduler.unschedule(TimerId::new(Topic::BlinkCursor, window_id));
+                        scheduler.unschedule(TimerId::new(Topic::BlinkTimeout, window_id));
+                        self.cursor_blink_timed_out = false;
+
+                        // Determine if cursor should blink for this pane.
+                        let mut cursor_style = self.config.cursor.style;
+                        let vi_mode = new_terminal.mode().contains(TermMode::VI);
+                        if vi_mode {
+                            cursor_style = self.config.cursor.vi_mode_style.unwrap_or(cursor_style);
+                        }
+                        let terminal_blinking = new_terminal.cursor_style().blinking;
+                        let mut blinking =
+                            cursor_style.blinking_override().unwrap_or(terminal_blinking);
+                        blinking &= (vi_mode
+                            || new_terminal.mode().contains(TermMode::SHOW_CURSOR))
+                            && self.display.ime.preedit().is_none();
+
+                        if blinking {
+                            self.display.cursor_hidden = false;
+                            self.dirty = true;
+
+                            let interval =
+                                Duration::from_millis(self.config.cursor.blink_interval());
+                            let timer_id = TimerId::new(Topic::BlinkCursor, window_id);
+                            let event = Event::new(EventType::BlinkCursor, window_id);
+                            scheduler.schedule(event, interval, true, timer_id);
+
+                            let timeout = self.config.cursor.blink_timeout();
+                            if timeout != Duration::ZERO {
+                                let timeout_id = TimerId::new(Topic::BlinkTimeout, window_id);
+                                let timeout_event =
+                                    Event::new(EventType::BlinkCursorTimeout, window_id);
+                                scheduler.schedule(timeout_event, timeout, false, timeout_id);
+                            }
+                        } else {
+                            self.display.cursor_hidden = false;
+                            self.dirty = true;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -562,7 +703,15 @@ impl WindowContext {
 
 impl Drop for WindowContext {
     fn drop(&mut self) {
-        // Shutdown the terminal's PTY.
-        let _ = self.notifier.0.send(Msg::Shutdown);
+        // Shutdown all panes' PTYs.
+        if let Some(ref pm) = self.pane_manager {
+            for pane_id in pm.pane_ids() {
+                if let Some(pane) = pm.pane(pane_id) {
+                    let _ = pane.notifier.0.send(Msg::Shutdown);
+                }
+            }
+        } else {
+            let _ = self.notifier.0.send(Msg::Shutdown);
+        }
     }
 }

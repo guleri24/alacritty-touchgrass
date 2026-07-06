@@ -44,14 +44,16 @@ use crate::config::window::Dimensions;
 use crate::config::window::StartupMode;
 use crate::display::bell::VisualBell;
 use crate::display::color::{List, Rgb};
-use crate::display::content::{RenderableContent, RenderableCursor};
+use crate::display::content::{RenderableCell, RenderableContent, RenderableCursor};
 use crate::display::cursor::IntoRects;
 use crate::display::damage::{DamageTracker, damage_y_to_viewport_y};
 use crate::display::hint::{HintMatch, HintState};
 use crate::display::meter::Meter;
 use crate::display::window::Window;
-use crate::event::{Event, EventType, Mouse, SearchState};
+use crate::event::{Event, EventType, Mouse, SearchState, SuggestionState};
 use crate::message_bar::{MessageBuffer, MessageType};
+use crate::pane::layout::PaneBounds;
+use crate::pane::manager::PaneManager;
 use crate::renderer::rects::{RenderLine, RenderLines, RenderRect};
 use crate::renderer::{self, GlyphCache, Renderer, platform};
 use crate::scheduler::{Scheduler, TimerId, Topic};
@@ -73,11 +75,36 @@ const FORWARD_SEARCH_LABEL: &str = "Search: ";
 /// Label for the backward terminal search bar.
 const BACKWARD_SEARCH_LABEL: &str = "Backward Search: ";
 
+/// Bundled per-pane rendering state to avoid too many parameters on `render_pane_grid_raw`.
+struct PaneRenderState<'a> {
+    config: &'a UiConfig,
+    search_state: &'a SearchState,
+}
+
+/// Bundled per-frame rendering state to avoid too many parameters on `Display::draw`.
+pub(crate) struct DrawContext<'a> {
+    pub pane_manager: Option<&'a PaneManager>,
+    pub scheduler: &'a mut Scheduler,
+    pub message_buffer: &'a MessageBuffer,
+    pub config: &'a UiConfig,
+    pub search_state: &'a mut SearchState,
+    pub suggestion_state: &'a SuggestionState,
+}
+
+/// String to prefix each suggestion with.
+const SUGGESTION_ITEM_PREFIX: &str = "  ";
+
+/// String to prefix the selected suggestion.
+const SUGGESTION_SELECTED_PREFIX: &str = "> ";
+
 /// The character used to shorten the visible text like uri preview or search regex.
 const SHORTENER: char = '…';
 
 /// Color which is used to highlight damaged rects when debugging.
 const DAMAGE_RECT_COLOR: Rgb = Rgb::new(255, 0, 255);
+
+/// Maximum number of suggestion items shown in the dropdown.
+pub const SUGGESTION_OVERLAY_LINES: usize = 6;
 
 #[derive(Debug)]
 pub enum Error {
@@ -178,7 +205,7 @@ impl From<SizeInfo<f32>> for SizeInfo<u32> {
             padding_x: size_info.padding_x as u32,
             padding_y: size_info.padding_y as u32,
             screen_lines: size_info.screen_lines,
-            columns: size_info.screen_lines,
+            columns: size_info.columns,
         }
     }
 }
@@ -775,13 +802,19 @@ impl Display {
     pub fn draw<T: EventListener>(
         &mut self,
         mut terminal: MutexGuard<'_, Term<T>>,
-        scheduler: &mut Scheduler,
-        message_buffer: &MessageBuffer,
-        config: &UiConfig,
-        search_state: &mut SearchState,
+        ctx: DrawContext<'_>,
     ) {
+        let DrawContext {
+            pane_manager,
+            scheduler,
+            message_buffer,
+            config,
+            search_state,
+            suggestion_state,
+        } = ctx;
+
         // Collect renderable content before the terminal is dropped.
-        let mut content = RenderableContent::new(config, self, &terminal, search_state);
+        let mut content = RenderableContent::new(config, self, &terminal, Some(search_state), true);
         let mut grid_cells = Vec::new();
         for cell in &mut content {
             grid_cells.push(cell);
@@ -814,6 +847,61 @@ impl Display {
         // Drop terminal as early as possible to free lock.
         drop(terminal);
 
+        // Collect additional pane render data if we have multiple panes.
+        let pane_render_data: Vec<(
+            PaneBounds,
+            Vec<RenderableCell>,
+            RenderableCursor,
+            usize,
+            Point,
+            usize,
+        )> = if let Some(pm) = pane_manager {
+            pm.pane_ids()
+                .iter()
+                .filter_map(|id| {
+                    if *id == pm.active_pane_id() {
+                        None // Skip active pane, already collected above.
+                    } else {
+                        let pane = pm.pane(*id)?;
+                        let mut pane_terminal = pane.terminal.lock();
+                        let bounds = pm.pane_bounds(*id).unwrap_or_default();
+                        let mut pane_content =
+                            RenderableContent::new(config, self, &pane_terminal, None, false);
+                        let mut cells = Vec::new();
+                        for cell in &mut pane_content {
+                            cells.push(cell);
+                        }
+                        let pane_display_offset = pane_content.display_offset();
+                        let pane_cursor = pane_content.cursor();
+                        let pane_cursor_point = pane_terminal.grid().cursor.point;
+                        let pane_total_lines = pane_terminal.grid().total_lines();
+
+                        // Track damage from this pane.
+                        match pane_terminal.damage() {
+                            TermDamage::Full => self.damage_tracker.frame().mark_fully_damaged(),
+                            TermDamage::Partial(damaged_lines) => {
+                                for damage in damaged_lines {
+                                    self.damage_tracker.frame().damage_line(damage);
+                                }
+                            },
+                        }
+                        pane_terminal.reset_damage();
+
+                        Some((
+                            bounds,
+                            cells,
+                            pane_cursor,
+                            pane_display_offset,
+                            pane_cursor_point,
+                            pane_total_lines,
+                        ))
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         // Invalidate highlighted hints if grid has changed.
         self.validate_hint_highlights(display_offset);
 
@@ -821,7 +909,8 @@ impl Display {
 
         let requires_full_damage = self.visual_bell.intensity() != 0.
             || self.hint_state.active()
-            || search_state.regex().is_some();
+            || search_state.regex().is_some()
+            || suggestion_state.active();
         if requires_full_damage {
             self.damage_tracker.frame().mark_fully_damaged();
             self.damage_tracker.next_frame().mark_fully_damaged();
@@ -836,77 +925,118 @@ impl Display {
         self.make_current();
 
         self.renderer.clear(background_color, config.window_opacity());
-        let mut lines = RenderLines::new();
 
-        // Optimize loop hint comparator.
-        let has_highlighted_hint =
-            self.highlighted_hint.is_some() || self.vi_highlighted_hint.is_some();
+        if let Some(pm) = pane_manager {
+            // Multi-pane rendering.
+            // Render active pane (already collected above).
+            if let Some(bounds) = pm.pane_bounds(pm.active_pane_id()) {
+                let state = PaneRenderState { config, search_state };
+                self.render_pane_grid_raw(
+                    &grid_cells,
+                    &cursor,
+                    display_offset,
+                    total_lines,
+                    vi_cursor_point,
+                    bounds,
+                    &state,
+                );
+            }
+            // Render non-active panes.
+            for (bounds, cells, pane_cursor, pane_offset, _pane_cursor_point, pane_total_lines) in
+                &pane_render_data
+            {
+                let state = PaneRenderState { config, search_state };
+                self.render_pane_grid_raw(
+                    cells,
+                    pane_cursor,
+                    *pane_offset,
+                    *pane_total_lines,
+                    None,
+                    *bounds,
+                    &state,
+                );
+            }
+            // Draw borders.
+            self.draw_pane_borders(pm, config);
 
-        // Draw grid.
-        {
-            let _sampler = self.meter.sampler();
+            // Restore viewport and projection to full window for overlays.
+            self.renderer.resize(&self.size_info);
+        } else {
+            // Single pane rendering (original path).
+            let mut lines = RenderLines::new();
+            let has_highlighted_hint =
+                self.highlighted_hint.is_some() || self.vi_highlighted_hint.is_some();
 
-            // Ensure macOS hasn't reset our viewport.
-            #[cfg(target_os = "macos")]
-            self.renderer.set_viewport(&size_info);
+            {
+                let _sampler = self.meter.sampler();
 
-            let glyph_cache = &mut self.glyph_cache;
-            let highlighted_hint = &self.highlighted_hint;
-            let vi_highlighted_hint = &self.vi_highlighted_hint;
-            let damage_tracker = &mut self.damage_tracker;
+                #[cfg(target_os = "macos")]
+                self.renderer.set_viewport(&size_info);
 
-            let cells = grid_cells.into_iter().map(|mut cell| {
-                // Underline hints hovered by mouse or vi mode cursor.
-                if has_highlighted_hint {
-                    let point = term::viewport_to_point(display_offset, cell.point);
-                    let hyperlink = cell.extra.as_ref().and_then(|extra| extra.hyperlink.as_ref());
+                let glyph_cache = &mut self.glyph_cache;
+                let highlighted_hint = &self.highlighted_hint;
+                let vi_highlighted_hint = &self.vi_highlighted_hint;
+                let damage_tracker = &mut self.damage_tracker;
 
-                    let should_highlight = |hint: &Option<HintMatch>| {
-                        hint.as_ref().is_some_and(|hint| hint.should_highlight(point, hyperlink))
-                    };
-                    if should_highlight(highlighted_hint) || should_highlight(vi_highlighted_hint) {
-                        damage_tracker.frame().damage_point(cell.point);
-                        cell.flags.insert(Flags::UNDERLINE);
+                let cells = grid_cells.into_iter().map(|mut cell| {
+                    if has_highlighted_hint {
+                        let point = term::viewport_to_point(display_offset, cell.point);
+                        let hyperlink =
+                            cell.extra.as_ref().and_then(|extra| extra.hyperlink.as_ref());
+                        let should_highlight = |hint: &Option<HintMatch>| {
+                            hint.as_ref()
+                                .is_some_and(|hint| hint.should_highlight(point, hyperlink))
+                        };
+                        if should_highlight(highlighted_hint)
+                            || should_highlight(vi_highlighted_hint)
+                        {
+                            damage_tracker.frame().damage_point(cell.point);
+                            cell.flags.insert(Flags::UNDERLINE);
+                        }
                     }
-                }
+                    lines.update(&cell);
+                    cell
+                });
+                self.renderer.draw_cells(&size_info, glyph_cache, cells);
+            }
 
-                // Update underline/strikeout.
-                lines.update(&cell);
+            let mut rects = lines.rects(&metrics, &size_info);
 
-                cell
-            });
-            self.renderer.draw_cells(&size_info, glyph_cache, cells);
+            if let Some(vi_cursor_point) = vi_cursor_point {
+                let line = (-vi_cursor_point.line.0 + size_info.bottommost_line().0) as usize;
+                let obstructed_column = Some(vi_cursor_point)
+                    .filter(|point| point.line == -(display_offset as i32))
+                    .map(|point| point.column);
+                self.draw_line_indicator(config, total_lines, obstructed_column, line);
+            } else if search_state.regex().is_some() {
+                self.draw_line_indicator(config, total_lines, None, display_offset);
+            };
+
+            rects.extend(cursor.rects(&size_info, config.cursor.thickness()));
+
+            let visual_bell_intensity = self.visual_bell.intensity();
+            if visual_bell_intensity != 0. {
+                let visual_bell_rect = RenderRect::new(
+                    0.,
+                    0.,
+                    size_info.width(),
+                    size_info.height(),
+                    config.bell.color,
+                    visual_bell_intensity as f32,
+                );
+                rects.push(visual_bell_rect);
+            }
+
+            self.renderer.draw_rects(&size_info, &metrics, rects);
         }
 
-        let mut rects = lines.rects(&metrics, &size_info);
-
-        if let Some(vi_cursor_point) = vi_cursor_point {
-            // Indicate vi mode by showing the cursor's position in the top right corner.
-            let line = (-vi_cursor_point.line.0 + size_info.bottommost_line().0) as usize;
-            let obstructed_column = Some(vi_cursor_point)
-                .filter(|point| point.line == -(display_offset as i32))
-                .map(|point| point.column);
-            self.draw_line_indicator(config, total_lines, obstructed_column, line);
-        } else if search_state.regex().is_some() {
-            // Show current display offset in vi-less search to indicate match position.
-            self.draw_line_indicator(config, total_lines, None, display_offset);
-        };
-
-        // Draw cursor.
-        rects.extend(cursor.rects(&size_info, config.cursor.thickness()));
-
-        // Push visual bell after url/underline/strikeout rects.
-        let visual_bell_intensity = self.visual_bell.intensity();
-        if visual_bell_intensity != 0. {
-            let visual_bell_rect = RenderRect::new(
-                0.,
-                0.,
-                size_info.width(),
-                size_info.height(),
-                config.bell.color,
-                visual_bell_intensity as f32,
-            );
-            rects.push(visual_bell_rect);
+        // Overlays (common to both paths).
+        // Draw suggestion overlay.
+        if suggestion_state.active() {
+            let cursor_viewport = term::point_to_viewport(display_offset, cursor_point);
+            let active_pane_bounds =
+                pane_manager.and_then(|pm| pm.pane_bounds(pm.active_pane_id()));
+            self.draw_suggestions(config, suggestion_state, cursor_viewport, active_pane_bounds);
         }
 
         // Handle IME positioning and search bar rendering.
@@ -918,22 +1048,20 @@ impl Display {
                 };
 
                 let search_text = Self::format_search(regex, search_label, size_info.columns());
-
-                // Render the search bar.
                 self.draw_search(config, &search_text);
 
-                // Draw search bar cursor.
                 let line = size_info.screen_lines();
                 let column = Column(search_text.chars().count() - 1);
 
-                // Add cursor to search bar if IME is not active.
                 if self.ime.preedit().is_none() {
                     let fg = config.colors.footer_bar_foreground();
                     let shape = CursorShape::Underline;
                     let cursor_width = NonZeroU32::new(1).unwrap();
                     let cursor =
                         RenderableCursor::new(Point::new(line, column), shape, fg, cursor_width);
-                    rects.extend(cursor.rects(&size_info, config.cursor.thickness()));
+                    let mut cursor_rects = Vec::new();
+                    cursor_rects.extend(cursor.rects(&size_info, config.cursor.thickness()));
+                    self.renderer.draw_rects(&size_info, &metrics, cursor_rects);
                 }
 
                 Some(Point::new(line, column))
@@ -948,7 +1076,6 @@ impl Display {
             },
         };
 
-        // Handle IME.
         if self.ime.is_enabled() {
             if let Some(point) = ime_position {
                 let (fg, bg) = if search_state.regex().is_some() {
@@ -956,8 +1083,9 @@ impl Display {
                 } else {
                     (foreground_color, background_color)
                 };
-
+                let mut rects = Vec::new();
                 self.draw_ime_preview(point, fg, bg, &mut rects, config);
+                self.renderer.draw_rects(&size_info, &metrics, rects);
             }
         }
 
@@ -965,7 +1093,6 @@ impl Display {
             let search_offset = usize::from(search_state.regex().is_some());
             let text = message.text(&size_info);
 
-            // Create a new rectangle for the background.
             let start_line = size_info.screen_lines() + search_offset;
             let y = size_info.cell_height().mul_add(start_line as f32, size_info.padding_y());
 
@@ -980,16 +1107,12 @@ impl Display {
             let message_bar_rect =
                 RenderRect::new(x as f32, y, width as f32, height as f32, bg, 1.);
 
-            // Push message_bar in the end, so it'll be above all other content.
-            rects.push(message_bar_rect);
+            let rects = vec![message_bar_rect];
 
-            // Always damage message bar, since it could have messages of the same size in it.
             self.damage_tracker.frame().add_viewport_rect(&size_info, x, y as i32, width, height);
 
-            // Draw rectangles.
             self.renderer.draw_rects(&size_info, &metrics, rects);
 
-            // Relay messages to the user.
             let glyph_cache = &mut self.glyph_cache;
             let fg = config.colors.primary.background;
             for (i, message_text) in text.iter().enumerate() {
@@ -1003,23 +1126,19 @@ impl Display {
                     glyph_cache,
                 );
             }
-        } else {
-            // Draw rectangles.
-            self.renderer.draw_rects(&size_info, &metrics, rects);
         }
 
         self.draw_render_timer(config);
 
-        // Draw hyperlink uri preview.
+        let has_highlighted_hint =
+            self.highlighted_hint.is_some() || self.vi_highlighted_hint.is_some();
         if has_highlighted_hint {
             let cursor_point = vi_cursor_point.or(Some(cursor_point));
             self.draw_hyperlink_preview(config, cursor_point, display_offset);
         }
 
-        // Notify winit that we're about to present.
         self.window.pre_present_notify();
 
-        // Highlight damage for debugging.
         if self.damage_tracker.debug {
             let damage = self.damage_tracker.shape_frame_damage(self.size_info.into());
             let mut rects = Vec::with_capacity(damage.len());
@@ -1027,23 +1146,157 @@ impl Display {
             self.renderer.draw_rects(&self.size_info, &metrics, rects);
         }
 
-        // Clearing debug highlights from the previous frame requires full redraw.
         self.swap_buffers();
 
         if matches!(self.raw_window_handle, RawWindowHandle::Xcb(_) | RawWindowHandle::Xlib(_)) {
-            // On X11 `swap_buffers` does not block for vsync. However the next OpenGl command
-            // will block to synchronize (this is `glClear` in Alacritty), which causes a
-            // permanent one frame delay.
             self.renderer.finish();
         }
 
-        // XXX: Request the new frame after swapping buffers, so the
-        // time to finish OpenGL operations is accounted for in the timeout.
         if !matches!(self.raw_window_handle, RawWindowHandle::Wayland(_)) {
             self.request_frame(scheduler);
         }
 
         self.damage_tracker.swap_damage();
+    }
+
+    /// Render pre-collected grid cells and cursor within pane bounds.
+    #[allow(clippy::too_many_arguments)]
+    fn render_pane_grid_raw(
+        &mut self,
+        grid_cells: &[RenderableCell],
+        cursor: &RenderableCursor,
+        display_offset: usize,
+        total_lines: usize,
+        vi_cursor_point: Option<Point>,
+        bounds: PaneBounds,
+        state: &PaneRenderState<'_>,
+    ) {
+        let padded = bounds.pad(self.size_info.padding_x(), self.size_info.padding_y());
+        let screen_height = self.size_info.height();
+        self.renderer.set_pane_viewport(
+            padded.x,
+            padded.y,
+            padded.width,
+            padded.height,
+            screen_height,
+        );
+
+        let size_info = self.size_info;
+        let metrics = self.glyph_cache.font_metrics();
+
+        let has_highlighted_hint =
+            self.highlighted_hint.is_some() || self.vi_highlighted_hint.is_some();
+
+        let mut lines = RenderLines::new();
+
+        {
+            let glyph_cache = &mut self.glyph_cache;
+            let highlighted_hint = &self.highlighted_hint;
+            let vi_highlighted_hint = &self.vi_highlighted_hint;
+            let damage_tracker = &mut self.damage_tracker;
+
+            let cells = grid_cells.iter().cloned().map(|mut cell| {
+                if has_highlighted_hint {
+                    let point = term::viewport_to_point(display_offset, cell.point);
+                    let hyperlink = cell.extra.as_ref().and_then(|extra| extra.hyperlink.as_ref());
+                    let should_highlight = |hint: &Option<HintMatch>| {
+                        hint.as_ref().is_some_and(|hint| hint.should_highlight(point, hyperlink))
+                    };
+                    if should_highlight(highlighted_hint) || should_highlight(vi_highlighted_hint) {
+                        damage_tracker.frame().damage_point(cell.point);
+                        cell.flags.insert(Flags::UNDERLINE);
+                    }
+                }
+                lines.update(&cell);
+                cell
+            });
+            self.renderer.draw_cells(&size_info, glyph_cache, cells);
+        }
+
+        let mut rects = lines.rects(&metrics, &size_info);
+
+        if let Some(vcp) = vi_cursor_point {
+            let line = (-vcp.line.0 + size_info.bottommost_line().0) as usize;
+            let obstructed_column = Some(vcp)
+                .filter(|point| point.line == -(display_offset as i32))
+                .map(|point| point.column);
+            self.draw_line_indicator(state.config, total_lines, obstructed_column, line);
+        } else if state.search_state.regex().is_some() {
+            self.draw_line_indicator(state.config, total_lines, None, display_offset);
+        }
+
+        rects.extend(cursor.rects(&size_info, state.config.cursor.thickness()));
+
+        // Offset rects by pane position for all panes (zeros for active pane).
+        for rect in &mut rects {
+            rect.x += bounds.x;
+            rect.y += bounds.y;
+        }
+
+        self.renderer.draw_rects(&size_info, &metrics, rects);
+    }
+
+    /// Draw borders between panes.
+    pub fn draw_pane_borders(&mut self, pane_manager: &PaneManager, config: &UiConfig) {
+        let size_info = self.size_info;
+        let border_width = pane_manager.border_width();
+        if border_width <= 0. {
+            return;
+        }
+
+        let border_color = config.pane.border_color;
+        let active_border_color = config.pane.active_border_color;
+        let active_id = pane_manager.active_pane_id();
+        let metrics = self.glyph_cache.font_metrics();
+
+        let mut rects = Vec::new();
+        for pane_id in pane_manager.pane_ids() {
+            let Some(bounds) = pane_manager.pane_bounds(pane_id) else { continue };
+            let color = if pane_id == active_id { active_border_color } else { border_color };
+
+            // Top edge
+            if bounds.y > 0. {
+                rects.push(RenderRect::new(
+                    bounds.x,
+                    bounds.y - border_width,
+                    bounds.width,
+                    border_width,
+                    color,
+                    1.,
+                ));
+            }
+            // Bottom edge
+            rects.push(RenderRect::new(
+                bounds.x,
+                bounds.y + bounds.height,
+                bounds.width,
+                border_width,
+                color,
+                1.,
+            ));
+            // Left edge
+            if bounds.x > 0. {
+                rects.push(RenderRect::new(
+                    bounds.x - border_width,
+                    bounds.y,
+                    border_width,
+                    bounds.height,
+                    color,
+                    1.,
+                ));
+            }
+            // Right edge
+            rects.push(RenderRect::new(
+                bounds.x + bounds.width,
+                bounds.y,
+                border_width,
+                bounds.height,
+                color,
+                1.,
+            ));
+        }
+
+        self.renderer.draw_rects(&size_info, &metrics, rects);
     }
 
     /// Update to a new configuration.
@@ -1093,7 +1346,9 @@ impl Display {
         }
 
         // Find highlighted hint at mouse position.
-        let point = mouse.point(&self.size_info, term.grid().display_offset());
+        let mut point = mouse.point(&self.size_info, term.grid().display_offset());
+        point.line = cmp::min(point.line, term.grid().bottommost_line());
+        point.column = cmp::min(point.column, term.grid().last_column());
         let highlighted_hint = hint::highlighted_at(term, config, point, modifiers);
 
         // Update cursor shape.
@@ -1323,6 +1578,110 @@ impl Display {
             &self.size_info,
             &mut self.glyph_cache,
         );
+    }
+
+    /// Draw suggestion dropdown at cursor position.
+    #[inline(never)]
+    fn draw_suggestions(
+        &mut self,
+        config: &UiConfig,
+        state: &SuggestionState,
+        cursor_viewport: Option<Point<usize>>,
+        pane_bounds: Option<PaneBounds>,
+    ) {
+        let cursor_viewport = match cursor_viewport {
+            Some(cursor) => cursor,
+            None => return,
+        };
+
+        let cell_height = self.size_info.cell_height();
+        let padding_x = self.size_info.padding_x();
+        let padding_y = self.size_info.padding_y();
+
+        // Compute pane-relative Y origin and pane height in lines.
+        let (y_origin, pane_screen_lines) = match pane_bounds {
+            Some(bounds) => {
+                let padded = bounds.pad(padding_x, padding_y);
+                let lines = (padded.height / cell_height) as usize;
+                (padded.y, lines)
+            },
+            None => (padding_y, self.size_info.screen_lines()),
+        };
+
+        let num_cols = self.size_info.columns();
+        let num_lines = state.suggestions.len().min(SUGGESTION_OVERLAY_LINES);
+
+        let fg = config.colors.footer_bar_foreground();
+        let bg = config.colors.footer_bar_background();
+
+        // Position dropdown: try below cursor; if too close to bottom, go above.
+        let start_line = if cursor_viewport.line + 1 + num_lines < pane_screen_lines {
+            cursor_viewport.line + 1
+        } else {
+            cursor_viewport.line.saturating_sub(num_lines)
+        };
+
+        // Draw background rect for the dropdown.
+        let y_start = y_origin + start_line as f32 * cell_height;
+        let height = num_lines as f32 * cell_height;
+        let width = self.size_info.width() - 2. * padding_x;
+        if width > 0. && height > 0. {
+            let bg_rect = RenderRect::new(padding_x, y_start, width, height, bg, 1.);
+            self.renderer.draw_rects(
+                &self.size_info,
+                &self.glyph_cache.font_metrics(),
+                vec![bg_rect],
+            );
+        }
+
+        // Set pane viewport and projection for text rendering.
+        if let Some(bounds) = pane_bounds {
+            let padded = bounds.pad(padding_x, padding_y);
+            self.renderer.set_pane_viewport(
+                padded.x,
+                padded.y,
+                padded.width,
+                padded.height,
+                self.size_info.height(),
+            );
+        }
+
+        // Draw suggestion list items.
+        for i in 0..num_lines {
+            let line = start_line + i;
+            if line >= pane_screen_lines {
+                break;
+            }
+
+            let prefix = if i == state.selected {
+                SUGGESTION_SELECTED_PREFIX
+            } else {
+                SUGGESTION_ITEM_PREFIX
+            };
+
+            let suggestion = &state.suggestions[i];
+            let max_len = num_cols.saturating_sub(prefix.len());
+            let display_text: String = if suggestion.len() > max_len {
+                format!("{}{}", prefix, &suggestion[..max_len.saturating_sub(1)])
+            } else {
+                format!("{}{:<width$}", prefix, suggestion, width = max_len)
+            };
+
+            let point = Point::new(line, Column(0));
+            self.renderer.draw_string(
+                point,
+                fg,
+                bg,
+                display_text.chars(),
+                &self.size_info,
+                &mut self.glyph_cache,
+            );
+        }
+
+        // Restore full-window state after pane-specific text rendering.
+        if pane_bounds.is_some() {
+            self.renderer.resize(&self.size_info);
+        }
     }
 
     /// Draw render timer.

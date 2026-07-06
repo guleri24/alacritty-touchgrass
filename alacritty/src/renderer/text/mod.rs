@@ -76,10 +76,31 @@ pub trait TextRenderer<'a> {
 
     /// Resize the text rendering.
     fn resize(&self, size: &SizeInfo) {
+        self.set_projection(size);
+    }
+
+    /// Set the text projection from SizeInfo.
+    fn set_projection(&self, size: &SizeInfo) {
         unsafe {
             let program = self.program();
             gl::UseProgram(program.id());
             update_projection(program.projection_uniform(), size);
+            gl::UseProgram(0);
+        }
+    }
+
+    /// Set the text projection for a pane region (width, height in pixels, includes padding).
+    fn set_pane_projection(&self, width: f32, height: f32, padding_x: f32, padding_y: f32) {
+        unsafe {
+            let program = self.program();
+            gl::UseProgram(program.id());
+            update_projection_rect(
+                program.projection_uniform(),
+                width,
+                height,
+                padding_x,
+                padding_y,
+            );
             gl::UseProgram(0);
         }
     }
@@ -201,7 +222,17 @@ fn update_projection(u_projection: GLint, size: &SizeInfo) {
     let height = size.height();
     let padding_x = size.padding_x();
     let padding_y = size.padding_y();
+    update_projection_rect(u_projection, width, height, padding_x, padding_y);
+}
 
+/// Same as update_projection but takes raw pixel dimensions instead of SizeInfo.
+fn update_projection_rect(
+    u_projection: GLint,
+    width: f32,
+    height: f32,
+    padding_x: f32,
+    padding_y: f32,
+) {
     // Bounds check.
     if (width as u32) < (2 * padding_x as u32) || (height as u32) < (2 * padding_y as u32) {
         return;
